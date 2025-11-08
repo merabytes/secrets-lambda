@@ -33,8 +33,6 @@ jobs:
             azure_region_code: EASTUS
           - aws_region: us-east-2
             azure_region_code: EASTUS2
-          - aws_region: us-west-1
-            azure_region_code: WESTUS
           - aws_region: us-west-2
             azure_region_code: WESTUS2
           
