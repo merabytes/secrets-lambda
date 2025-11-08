@@ -1,0 +1,570 @@
+name: Deploy Secrets Lambda to AWS (Multi-Region)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: acido-secrets
+  LAMBDA_FUNCTION_NAME: acido-secrets
+
+jobs:
+  deploy:
+    name: Deploy to ${{ matrix.aws_region }}
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    strategy:
+      fail-fast: false  # Continue deploying to other regions even if one fails
+      max-parallel: 5  # Limit parallel deployments to avoid rate limits
+      matrix:
+        # AWS regions with corresponding Azure region codes for secret naming
+        # Format: {aws_region: "...", azure_region_code: "..."}
+        # Azure region code is UPPERCASE version of programmatic name for GitHub Secrets
+        include:
+          # US Regions
+          - aws_region: us-east-1
+            azure_region_code: EASTUS
+          - aws_region: us-east-2
+            azure_region_code: EASTUS2
+          - aws_region: us-west-1
+            azure_region_code: WESTUS
+          - aws_region: us-west-2
+            azure_region_code: WESTUS2
+          
+          # Europe Regions
+          - aws_region: eu-west-1
+            azure_region_code: NORTHEUROPE
+          - aws_region: eu-west-2
+            azure_region_code: UKSOUTH
+          - aws_region: eu-west-3
+            azure_region_code: FRANCECENTRAL
+          - aws_region: eu-central-1
+            azure_region_code: GERMANYWESTCENTRAL
+          - aws_region: eu-north-1
+            azure_region_code: SWEDENCENTRAL
+          - aws_region: eu-south-1
+            azure_region_code: ITALYNORTH
+          
+          # Asia Pacific Regions
+          - aws_region: ap-northeast-1
+            azure_region_code: JAPANEAST
+          - aws_region: ap-northeast-2
+            azure_region_code: KOREACENTRAL
+          - aws_region: ap-northeast-3
+            azure_region_code: JAPANWEST
+          - aws_region: ap-southeast-1
+            azure_region_code: SOUTHEASTASIA
+          - aws_region: ap-southeast-2
+            azure_region_code: AUSTRALIAEAST
+          - aws_region: ap-southeast-3
+            azure_region_code: INDONESIACENTRAL
+          - aws_region: ap-southeast-5
+            azure_region_code: MALAYSIAWEST
+          - aws_region: ap-south-1
+            azure_region_code: CENTRALINDIA
+          - aws_region: ap-south-2
+            azure_region_code: SOUTHINDIA
+          - aws_region: ap-east-1
+            azure_region_code: EASTASIA
+          
+          # Canada Regions
+          - aws_region: ca-central-1
+            azure_region_code: CANADACENTRAL
+          - aws_region: ca-west-1
+            azure_region_code: CANADAEAST
+          
+          # South America
+          - aws_region: sa-east-1
+            azure_region_code: BRAZILSOUTH
+          
+          # Middle East
+          - aws_region: me-central-1
+            azure_region_code: UAENORTH
+          
+          # Africa
+          - aws_region: af-south-1
+            azure_region_code: SOUTHAFRICANORTH
+          
+          # Israel
+          - aws_region: il-central-1
+            azure_region_code: ISRAELCENTRAL
+          
+          # Mexico
+          - aws_region: mx-central-1
+            azure_region_code: MEXICOCENTRAL
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Parse Azure region configuration from JSON
+      id: parse-config
+      env:
+        AZURE_REGION_CONFIGS: ${{ secrets.AZURE_REGION_CONFIGS }}
+        AZURE_REGION_CODE: ${{ matrix.azure_region_code }}
+      run: |
+        echo "Parsing Azure configuration for region: $AZURE_REGION_CODE"
+        
+        # Check if AZURE_REGION_CONFIGS secret exists
+        if [ -z "$AZURE_REGION_CONFIGS" ]; then
+          echo "⚠️  ERROR: AZURE_REGION_CONFIGS secret not found"
+          echo "Please configure the AZURE_REGION_CONFIGS secret with JSON configuration"
+          echo "has_config=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Parse JSON to extract region-specific configuration
+        REGION_CONFIG=$(echo "$AZURE_REGION_CONFIGS" | jq -r --arg region "$AZURE_REGION_CODE" '.[$region] // empty')
+        
+        if [ -z "$REGION_CONFIG" ] || [ "$REGION_CONFIG" = "null" ]; then
+          echo "⚠️  WARNING: No configuration found for region $AZURE_REGION_CODE in AZURE_REGION_CONFIGS"
+          echo "Skipping deployment to ${{ matrix.aws_region }} (Azure config not found for this region)"
+          echo "has_config=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Extract individual values from region config
+        AZURE_TENANT_ID=$(echo "$REGION_CONFIG" | jq -r '.AZURE_TENANT_ID // empty')
+        AZURE_CLIENT_ID=$(echo "$REGION_CONFIG" | jq -r '.AZURE_CLIENT_ID // empty')
+        AZURE_CLIENT_SECRET=$(echo "$REGION_CONFIG" | jq -r '.AZURE_CLIENT_SECRET // empty')
+        KEY_VAULT_NAME=$(echo "$REGION_CONFIG" | jq -r '.AZURE_KEY_VAULT_NAME // empty')
+        
+        # Validate all required fields are present
+        MISSING_FIELDS=()
+        
+        if [ -z "$AZURE_TENANT_ID" ]; then
+          MISSING_FIELDS+=("AZURE_TENANT_ID")
+        fi
+        
+        if [ -z "$AZURE_CLIENT_ID" ]; then
+          MISSING_FIELDS+=("AZURE_CLIENT_ID")
+        fi
+        
+        if [ -z "$AZURE_CLIENT_SECRET" ]; then
+          MISSING_FIELDS+=("AZURE_CLIENT_SECRET")
+        fi
+        
+        if [ -z "$KEY_VAULT_NAME" ]; then
+          MISSING_FIELDS+=("AZURE_KEY_VAULT_NAME")
+        fi
+        
+        if [ ${#MISSING_FIELDS[@]} -gt 0 ]; then
+          echo "⚠️  WARNING: Missing required fields in $AZURE_REGION_CODE configuration:"
+          for field in "${MISSING_FIELDS[@]}"; do
+            echo "  - $field"
+          done
+          echo ""
+          echo "Skipping deployment to ${{ matrix.aws_region }} (incomplete Azure configuration)"
+          echo "has_config=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Save parsed values to output for use in subsequent steps
+        echo "azure_tenant_id=$AZURE_TENANT_ID" >> $GITHUB_OUTPUT
+        echo "azure_client_id=$AZURE_CLIENT_ID" >> $GITHUB_OUTPUT
+        echo "azure_client_secret=$AZURE_CLIENT_SECRET" >> $GITHUB_OUTPUT
+        echo "key_vault_name=$KEY_VAULT_NAME" >> $GITHUB_OUTPUT
+        echo "has_config=true" >> $GITHUB_OUTPUT
+        
+        echo "✓ Successfully parsed Azure configuration for $AZURE_REGION_CODE"
+
+    - name: Configure AWS credentials for ${{ matrix.aws_region }}
+      if: steps.parse-config.outputs.has_config == 'true'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ matrix.aws_region }}
+
+    - name: Check if Lambda function exists
+      if: steps.parse-config.outputs.has_config == 'true'
+      id: check-lambda
+      run: |
+        if aws lambda get-function --function-name ${{ env.LAMBDA_FUNCTION_NAME }} --region ${{ matrix.aws_region }} >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+          echo "✓ Lambda function exists in ${{ matrix.aws_region }}"
+          
+          # Get the current image URI to determine the ECR registry for this region
+          IMAGE_URI=$(aws lambda get-function \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --region ${{ matrix.aws_region }} \
+            --query 'Code.ImageUri' \
+            --output text)
+          
+          echo "Current image URI: $IMAGE_URI"
+          
+          # Extract the ECR registry URL (everything before the repository name)
+          # Format: 318257425368.dkr.ecr.us-east-1.amazonaws.com/acido-secrets@sha256:...
+          ECR_REGISTRY=$(echo "$IMAGE_URI" | cut -d'/' -f1)
+          echo "ECR Registry for this region: $ECR_REGISTRY"
+          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+          echo "⚠️  Lambda function does not exist in ${{ matrix.aws_region }}"
+          echo "Lambda must be created manually before first deployment"
+        fi
+
+    - name: Login to Amazon ECR for ${{ matrix.aws_region }}
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      id: login-ecr-region
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to region-specific ECR
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      env:
+        IMAGE_TAG: ${{ github.sha }}
+        TARGET_REGISTRY: ${{ steps.check-lambda.outputs.ecr_registry }}
+      run: |
+        echo "Building Docker image..."
+        docker build -t $TARGET_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG -f Dockerfile .
+        
+        echo "Tagging image for ${{ matrix.aws_region }} ECR..."
+        docker tag $TARGET_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG $TARGET_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+        
+        echo "Pushing to ${{ matrix.aws_region }} ECR..."
+        docker push $TARGET_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+        docker push $TARGET_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+        
+        echo "✓ Image built and pushed to $TARGET_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+
+    - name: Update Lambda function with new image in ${{ matrix.aws_region }}
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      env:
+        IMAGE_TAG: ${{ github.sha }}
+        TARGET_REGISTRY: ${{ steps.check-lambda.outputs.ecr_registry }}
+      run: |
+        # Use the region-specific ECR image
+        REGION_IMAGE_URI="${TARGET_REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+        
+        echo "Updating Lambda function with image: $REGION_IMAGE_URI"
+        
+        aws lambda update-function-code \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --image-uri $REGION_IMAGE_URI \
+          --region ${{ matrix.aws_region }}
+
+    - name: Wait for Lambda update to complete
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      run: |
+        echo "Waiting for Lambda function update to complete in ${{ matrix.aws_region }}..."
+        aws lambda wait function-updated \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --region ${{ matrix.aws_region }}
+        echo "Lambda function update completed successfully"
+
+    - name: Generate SECRET_KEY for additional encryption layer
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      id: generate-secret-key
+      run: |
+        # Generate a random 64-character hex string for SECRET_KEY
+        SECRET_KEY=$(openssl rand -hex 32)
+        echo "::add-mask::$SECRET_KEY"
+        echo "secret_key=$SECRET_KEY" >> $GITHUB_OUTPUT
+        echo "Generated SECRET_KEY for additional encryption layer (masked)"
+
+    - name: Update Lambda environment variables with region-specific Azure credentials
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      env:
+        AZURE_TENANT_ID: ${{ steps.parse-config.outputs.azure_tenant_id }}
+        AZURE_CLIENT_ID: ${{ steps.parse-config.outputs.azure_client_id }}
+        AZURE_CLIENT_SECRET: ${{ steps.parse-config.outputs.azure_client_secret }}
+        KEY_VAULT_NAME: ${{ steps.parse-config.outputs.key_vault_name }}
+        SECRET_KEY: ${{ steps.generate-secret-key.outputs.secret_key }}
+      run: |
+        # Build environment variables JSON with region-specific Azure credentials
+        ENV_VARS="KEY_VAULT_NAME=${KEY_VAULT_NAME},AZURE_TENANT_ID=${AZURE_TENANT_ID},AZURE_CLIENT_ID=${AZURE_CLIENT_ID},AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}"
+        
+        # Add SECRET_KEY for additional encryption layer
+        ENV_VARS="${ENV_VARS},SECRET_KEY=${SECRET_KEY}"
+        echo "Added SECRET_KEY to Lambda environment variables (value masked)"
+        
+        # Add optional CF_SECRET_KEY if set
+        if [ -n "${{ secrets.CF_SECRET_KEY }}" ]; then
+          ENV_VARS="${ENV_VARS},CF_SECRET_KEY=${{ secrets.CF_SECRET_KEY }}"
+          echo "CloudFlare Turnstile bot protection enabled"
+        else
+          echo "CloudFlare Turnstile bot protection not configured (optional)"
+        fi
+        
+        # Add optional CORS_ORIGIN if set, defaults to https://secrets.merabytes.com
+        if [ -n "${{ secrets.CORS_ORIGIN }}" ]; then
+          ENV_VARS="${ENV_VARS},CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}"
+          echo "CORS origin set to: ${{ secrets.CORS_ORIGIN }}"
+        else
+          ENV_VARS="${ENV_VARS},CORS_ORIGIN=https://secrets.merabytes.com"
+          echo "CORS origin using default: https://secrets.merabytes.com"
+        fi
+        
+        echo "Updating Lambda with Azure credentials for region: ${{ matrix.azure_region_code }}"
+        
+        aws lambda update-function-configuration \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --environment "Variables={${ENV_VARS}}" \
+          --region ${{ matrix.aws_region }}
+
+    - name: Wait for environment update to complete
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      run: |
+        echo "Waiting for Lambda environment update to complete..."
+        aws lambda wait function-updated \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --region ${{ matrix.aws_region }}
+        echo "Lambda environment update completed successfully"
+
+    - name: Get Lambda function URL
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      id: get-function-url
+      run: |
+        echo "Lambda function deployment completed in ${{ matrix.aws_region }}!"
+        
+        # Get function URL configuration
+        FUNCTION_URL=$(aws lambda get-function-url-config \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --region ${{ matrix.aws_region }} \
+          --query 'FunctionUrl' \
+          --output text 2>/dev/null || echo "No URL configured")
+        
+        echo "function_url=${FUNCTION_URL}" >> $GITHUB_OUTPUT
+        echo "Function URL: ${FUNCTION_URL}"
+        
+        # Get function info
+        aws lambda get-function \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --region ${{ matrix.aws_region }} \
+          --query 'Configuration.[FunctionName,LastModified,State,ImageUri]' \
+          --output table
+
+    - name: Save function URL to artifact
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      run: |
+        mkdir -p deployment-urls
+        FUNCTION_URL="${{ steps.get-function-url.outputs.function_url }}"
+        if [ -n "$FUNCTION_URL" ] && [ "$FUNCTION_URL" != "No URL configured" ]; then
+          echo "$FUNCTION_URL" > deployment-urls/${{ matrix.aws_region }}.txt
+          echo "Saved function URL for ${{ matrix.aws_region }}"
+        else
+          echo "No URL configured" > deployment-urls/${{ matrix.aws_region }}.txt
+          echo "No function URL configured for ${{ matrix.aws_region }}"
+        fi
+
+    - name: Upload function URL artifact
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: function-url-${{ matrix.aws_region }}
+        path: deployment-urls/${{ matrix.aws_region }}.txt
+        retention-days: 1
+
+    - name: Test Lambda Function
+      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      env:
+        FUNCTION_URL: ${{ steps.get-function-url.outputs.function_url }}
+        CORS_ORIGIN: ${{ secrets.CORS_ORIGIN }}
+      run: |
+        if [ -n "$FUNCTION_URL" ] && [ "$FUNCTION_URL" != "No URL configured" ]; then
+          echo "=========================================="
+          echo "Testing deployed Lambda in ${{ matrix.aws_region }}"
+          echo "=========================================="
+          
+          # Use configured CORS origin or default
+          ORIGIN_URL="${CORS_ORIGIN:-https://secrets.merabytes.com}"
+          echo "Testing with CORS origin: $ORIGIN_URL"
+          
+          # Test healthcheck with CORS headers
+          echo ""
+          echo "Test: Healthcheck endpoint with CORS validation..."
+          healthcheck_response=$(curl -i -X POST "$FUNCTION_URL" \
+            -H "Content-Type: application/json" \
+            -H "Origin: $ORIGIN_URL" \
+            -H 'User-Agent: Merabytes-Portal' \
+            -d '{"action":"healthcheck"}' \
+            --max-time 30 \
+            --silent \
+            --write-out "\n%{http_code}")
+          
+          # Extract HTTP status code and body
+          healthcheck_http_code=$(echo "$healthcheck_response" | tail -n1)
+          healthcheck_body=$(echo "$healthcheck_response" | sed '$d')
+          
+          echo "HTTP Status Code: $healthcheck_http_code"
+          echo "Response Headers and Body:"
+          echo "$healthcheck_body"
+          
+          # Check if healthcheck was successful (200)
+          if [ "$healthcheck_http_code" -eq 200 ]; then
+            echo "✓ Healthcheck test PASSED for ${{ matrix.aws_region }}"
+            
+            # Verify CORS headers are present
+            if echo "$healthcheck_body" | grep -q "Access-Control-Allow-Origin"; then
+              echo "✓ CORS headers present"
+            else
+              echo "⚠ CORS headers not found in response"
+            fi
+            
+            # Verify response body
+            if echo "$healthcheck_body" | grep -q "healthy"; then
+              echo "✓ Healthcheck response valid"
+            else
+              echo "⚠ Healthcheck response format unexpected"
+            fi
+            
+            echo ""
+            echo "=========================================="
+            echo "✓ Lambda healthcheck test PASSED"
+            echo "  Region: ${{ matrix.aws_region }}"
+            echo "  Azure Region: ${{ matrix.azure_region_code }}"
+            echo "  Lambda function is running"
+            echo "  CORS headers configured correctly"
+            echo "  Healthcheck endpoint working"
+            echo "=========================================="
+          else
+            echo "✗ Healthcheck test FAILED for ${{ matrix.aws_region }}"
+            echo "Expected HTTP 200, got $healthcheck_http_code"
+            exit 1
+          fi
+        else
+          echo "⚠ Function URL not configured for ${{ matrix.aws_region }}, skipping test"
+          echo "To enable testing, configure a Lambda Function URL"
+        fi
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    
+    permissions:
+      contents: read
+    
+    steps:
+    - name: Download all function URL artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: function-url-*
+        path: deployment-urls
+        merge-multiple: true
+      continue-on-error: true
+
+    - name: Generate JSON output with function URLs
+      run: |
+        echo "=========================================="
+        echo "Lambda Function URLs (JSON Output)"
+        echo "=========================================="
+        echo ""
+        
+        # Initialize JSON object
+        echo "{" > function-urls.json
+        
+        # Check if deployment-urls directory exists and has files
+        if [ -d "deployment-urls" ] && [ "$(ls -A deployment-urls 2>/dev/null)" ]; then
+          first=true
+          
+          # Process each region file
+          for file in deployment-urls/*.txt; do
+            if [ -f "$file" ]; then
+              region=$(basename "$file" .txt)
+              url=$(cat "$file" | tr -d '\n\r')
+              
+              # Skip if URL is "No URL configured"
+              if [ "$url" != "No URL configured" ] && [ -n "$url" ]; then
+                # Add comma before all entries except the first
+                if [ "$first" = false ]; then
+                  echo "," >> function-urls.json
+                fi
+                first=false
+                
+                # Add region and URL to JSON
+                echo -n "  \"$region\": \"$url\"" >> function-urls.json
+              fi
+            fi
+          done
+          
+          # Close JSON object
+          echo "" >> function-urls.json
+          echo "}" >> function-urls.json
+          
+          # Display the JSON output
+          echo "Function URLs JSON:"
+          cat function-urls.json
+          echo ""
+        else
+          echo "No function URLs found from deployment artifacts"
+          echo "{}" > function-urls.json
+        fi
+        
+        echo ""
+        echo "=========================================="
+
+    - name: Generate deployment summary
+      run: |
+        echo "=========================================="
+        echo "Multi-Region Deployment Summary (All Regions)"
+        echo "=========================================="
+        echo ""
+        echo "Deployment attempted for all configured AWS regions:"
+        echo ""
+        echo "US Regions:"
+        echo "  • us-east-1, us-east-2, us-west-1, us-west-2"
+        echo ""
+        echo "Europe Regions:"
+        echo "  • eu-west-1, eu-west-2, eu-west-3"
+        echo "  • eu-central-1, eu-central-2"
+        echo "  • eu-north-1, eu-south-1"
+        echo ""
+        echo "Asia Pacific Regions:"
+        echo "  • ap-northeast-1, ap-northeast-2, ap-northeast-3"
+        echo "  • ap-southeast-1, ap-southeast-2, ap-southeast-3, ap-southeast-5"
+        echo "  • ap-south-1, ap-south-2, ap-east-1"
+        echo ""
+        echo "Other Regions:"
+        echo "  • ca-central-1, ca-west-1 (Canada)"
+        echo "  • sa-east-1 (South America)"
+        echo "  • me-central-1 (Middle East)"
+        echo "  • af-south-1 (Africa)"
+        echo "  • il-central-1 (Israel)"
+        echo "  • mx-central-1 (Mexico)"
+        echo ""
+        echo "=========================================="
+        echo "Azure Configuration (JSON-based)"
+        echo "=========================================="
+        echo ""
+        echo "All regions are configured via a single GitHub Secret:"
+        echo "  AZURE_REGION_CONFIGS"
+        echo ""
+        echo "JSON Structure:"
+        echo '  {'
+        echo '    "REGIONCODE": {'
+        echo '      "AZURE_TENANT_ID": "xxx",'
+        echo '      "AZURE_CLIENT_ID": "xxx",'
+        echo '      "AZURE_CLIENT_SECRET": "xxx",'
+        echo '      "AZURE_KEY_VAULT_NAME": "xxx"'
+        echo '    },'
+        echo '    "ANOTHER_REGION": { ... }'
+        echo '  }'
+        echo ""
+        echo "Supported region codes (Azure programmatic names in UPPERCASE):"
+        echo "  EASTUS, EASTUS2, WESTUS, WESTUS2,"
+        echo "  NORTHEUROPE, WESTEUROPE, UKSOUTH, FRANCECENTRAL,"
+        echo "  GERMANYWESTCENTRAL, SWITZERLANDNORTH, SWEDENCENTRAL,"
+        echo "  ITALYNORTH,"
+        echo "  JAPANEAST, JAPANWEST, KOREACENTRAL,"
+        echo "  SOUTHEASTASIA, AUSTRALIAEAST, INDONESIACENTRAL,"
+        echo "  MALAYSIAWEST,"
+        echo "  CENTRALINDIA, SOUTHINDIA, EASTASIA,"
+        echo "  CANADACENTRAL, CANADAEAST, BRAZILSOUTH,"
+        echo "  UAENORTH, SOUTHAFRICANORTH,"
+        echo "  ISRAELCENTRAL, MEXICOCENTRAL"
+        echo ""
+        echo "To generate Azure credentials, run:"
+        echo "  ./scripts/setup-azure-credentials.sh --azure-subscription YOUR_SUB_ID"
+        echo ""
+        echo "Then convert the output azure-credentials.env to JSON format"
+        echo "and store in AZURE_REGION_CONFIGS secret"
+        echo "=========================================="
