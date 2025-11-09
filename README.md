@@ -1,10 +1,10 @@
-# Acido Secrets Sharing Service
+# Merabytes Secrets Sharing Service
 
 A OneTimeSecret-like service built on AWS Lambda and Azure KeyVault that allows secure sharing of secrets with one-time access.
 
 ## Overview
 
-The Acido Secrets Sharing Service provides a simple yet secure way to share sensitive information. Secrets are:
+The Merabytes Secrets Sharing Service provides a simple yet secure way to share sensitive information. Secrets are:
 - Stored securely in Azure KeyVault
 - Identified by a unique UUID
 - Accessible only once (retrieved and immediately deleted)
