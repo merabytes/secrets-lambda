@@ -257,64 +257,64 @@ jobs:
           --region ${{ matrix.aws_region }}
         echo "Lambda function update completed successfully"
 
-    - name: Generate SECRET_KEY for additional encryption layer
-      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
-      id: generate-secret-key
-      run: |
-        # Generate a random 64-character hex string for SECRET_KEY
-        SECRET_KEY=$(openssl rand -hex 32)
-        echo "::add-mask::$SECRET_KEY"
-        echo "secret_key=$SECRET_KEY" >> $GITHUB_OUTPUT
-        echo "Generated SECRET_KEY for additional encryption layer (masked)"
+    # - name: Generate SECRET_KEY for additional encryption layer
+    #   if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+    #   id: generate-secret-key
+    #   run: |
+    #     # Generate a random 64-character hex string for SECRET_KEY
+    #     SECRET_KEY=$(openssl rand -hex 32)
+    #     echo "::add-mask::$SECRET_KEY"
+    #     echo "secret_key=$SECRET_KEY" >> $GITHUB_OUTPUT
+    #     echo "Generated SECRET_KEY for additional encryption layer (masked)"
 
-    - name: Update Lambda environment variables with region-specific Azure credentials
-      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
-      env:
-        AZURE_TENANT_ID: ${{ steps.parse-config.outputs.azure_tenant_id }}
-        AZURE_CLIENT_ID: ${{ steps.parse-config.outputs.azure_client_id }}
-        AZURE_CLIENT_SECRET: ${{ steps.parse-config.outputs.azure_client_secret }}
-        KEY_VAULT_NAME: ${{ steps.parse-config.outputs.key_vault_name }}
-        SECRET_KEY: ${{ steps.generate-secret-key.outputs.secret_key }}
-      run: |
-        # Build environment variables JSON with region-specific Azure credentials
-        ENV_VARS="KEY_VAULT_NAME=${KEY_VAULT_NAME},AZURE_TENANT_ID=${AZURE_TENANT_ID},AZURE_CLIENT_ID=${AZURE_CLIENT_ID},AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}"
-        
-        # Add SECRET_KEY for additional encryption layer
-        ENV_VARS="${ENV_VARS},SECRET_KEY=${SECRET_KEY}"
-        echo "Added SECRET_KEY to Lambda environment variables (value masked)"
-        
-        # Add optional CF_SECRET_KEY if set
-        if [ -n "${{ secrets.CF_SECRET_KEY }}" ]; then
-          ENV_VARS="${ENV_VARS},CF_SECRET_KEY=${{ secrets.CF_SECRET_KEY }}"
-          echo "CloudFlare Turnstile bot protection enabled"
-        else
-          echo "CloudFlare Turnstile bot protection not configured (optional)"
-        fi
-        
-        # Add optional CORS_ORIGIN if set, defaults to https://secrets.merabytes.com
-        if [ -n "${{ secrets.CORS_ORIGIN }}" ]; then
-          ENV_VARS="${ENV_VARS},CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}"
-          echo "CORS origin set to: ${{ secrets.CORS_ORIGIN }}"
-        else
-          ENV_VARS="${ENV_VARS},CORS_ORIGIN=https://secrets.merabytes.com"
-          echo "CORS origin using default: https://secrets.merabytes.com"
-        fi
-        
-        echo "Updating Lambda with Azure credentials for region: ${{ matrix.azure_region_code }}"
-        
-        aws lambda update-function-configuration \
-          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
-          --environment "Variables={${ENV_VARS}}" \
-          --region ${{ matrix.aws_region }}
+    # - name: Update Lambda environment variables with region-specific Azure credentials
+    #   if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+    #   env:
+    #     AZURE_TENANT_ID: ${{ steps.parse-config.outputs.azure_tenant_id }}
+    #     AZURE_CLIENT_ID: ${{ steps.parse-config.outputs.azure_client_id }}
+    #     AZURE_CLIENT_SECRET: ${{ steps.parse-config.outputs.azure_client_secret }}
+    #     KEY_VAULT_NAME: ${{ steps.parse-config.outputs.key_vault_name }}
+    #     SECRET_KEY: ${{ steps.generate-secret-key.outputs.secret_key }}
+    #   run: |
+    #     # Build environment variables JSON with region-specific Azure credentials
+    #     ENV_VARS="KEY_VAULT_NAME=${KEY_VAULT_NAME},AZURE_TENANT_ID=${AZURE_TENANT_ID},AZURE_CLIENT_ID=${AZURE_CLIENT_ID},AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}"
+    #     
+    #     # Add SECRET_KEY for additional encryption layer
+    #     ENV_VARS="${ENV_VARS},SECRET_KEY=${SECRET_KEY}"
+    #     echo "Added SECRET_KEY to Lambda environment variables (value masked)"
+    #     
+    #     # Add optional CF_SECRET_KEY if set
+    #     if [ -n "${{ secrets.CF_SECRET_KEY }}" ]; then
+    #       ENV_VARS="${ENV_VARS},CF_SECRET_KEY=${{ secrets.CF_SECRET_KEY }}"
+    #       echo "CloudFlare Turnstile bot protection enabled"
+    #     else
+    #       echo "CloudFlare Turnstile bot protection not configured (optional)"
+    #     fi
+    #     
+    #     # Add optional CORS_ORIGIN if set, defaults to https://secrets.merabytes.com
+    #     if [ -n "${{ secrets.CORS_ORIGIN }}" ]; then
+    #       ENV_VARS="${ENV_VARS},CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}"
+    #       echo "CORS origin set to: ${{ secrets.CORS_ORIGIN }}"
+    #     else
+    #       ENV_VARS="${ENV_VARS},CORS_ORIGIN=https://secrets.merabytes.com"
+    #       echo "CORS origin using default: https://secrets.merabytes.com"
+    #     fi
+    #     
+    #     echo "Updating Lambda with Azure credentials for region: ${{ matrix.azure_region_code }}"
+    #     
+    #     aws lambda update-function-configuration \
+    #       --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+    #       --environment "Variables={${ENV_VARS}}" \
+    #       --region ${{ matrix.aws_region }}
 
-    - name: Wait for environment update to complete
-      if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
-      run: |
-        echo "Waiting for Lambda environment update to complete..."
-        aws lambda wait function-updated \
-          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
-          --region ${{ matrix.aws_region }}
-        echo "Lambda environment update completed successfully"
+    # - name: Wait for environment update to complete
+    #   if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
+    #   run: |
+    #     echo "Waiting for Lambda environment update to complete..."
+    #     aws lambda wait function-updated \
+    #       --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+    #       --region ${{ matrix.aws_region }}
+    #     echo "Lambda environment update completed successfully"
 
     - name: Get Lambda function URL
       if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true'
