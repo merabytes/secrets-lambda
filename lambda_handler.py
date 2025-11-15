@@ -78,6 +78,94 @@ def _get_version():
         return 'unknown'
 
 
+def _delete_secret_and_metadata(vault_manager, secret_uuid):
+    """
+    Delete a secret and all its associated metadata.
+    
+    Args:
+        vault_manager: VaultManager instance
+        secret_uuid: UUID of the secret to delete
+    """
+    vault_manager.delete_secret(secret_uuid)
+    
+    # Delete metadata if it exists
+    try:
+        vault_manager.delete_secret(f"{secret_uuid}-metadata")
+    except Exception:
+        pass
+    
+    # Delete expiration metadata if it exists
+    try:
+        vault_manager.delete_secret(f"{secret_uuid}-expires")
+    except Exception:
+        pass
+
+
+def _check_expiration(vault_manager, secret_uuid):
+    """
+    Check if a secret has expired. Returns None if not expired or doesn't have expiration.
+    
+    Args:
+        vault_manager: VaultManager instance
+        secret_uuid: UUID of the secret to check
+        
+    Returns:
+        dict with error response if expired, None otherwise
+    """
+    expires_key = f"{secret_uuid}-expires"
+    try:
+        expires_at_str = vault_manager.get_secret(expires_key)
+        expires_at_unix = int(expires_at_str)
+        expires_at = datetime.fromtimestamp(expires_at_unix, tz=timezone.utc)
+        now = datetime.now(timezone.utc)
+        
+        if now >= expires_at:
+            # Secret has expired - delete it and all metadata
+            _delete_secret_and_metadata(vault_manager, secret_uuid)
+            return build_response(410, {
+                'error': 'Secret has expired and has been deleted',
+                'expired_at': expires_at_unix
+            }, CORS_HEADERS)
+    except Exception:
+        # No expiration metadata means secret doesn't expire
+        pass
+    
+    return None
+
+
+def _validate_expiration_time(expires_at):
+    """
+    Validate and parse expiration timestamp.
+    
+    Args:
+        expires_at: UNIX timestamp (integer or string)
+        
+    Returns:
+        tuple: (expiration_unix, error_response) - one will be None
+    """
+    if not expires_at:
+        return None, None
+    
+    try:
+        expiration_unix = int(expires_at)
+        expiration_datetime = datetime.fromtimestamp(expiration_unix, tz=timezone.utc)
+        
+        # Ensure the expiration is in the future
+        now = datetime.now(timezone.utc)
+        if expiration_datetime <= now:
+            return None, build_error_response(
+                'expires_at must be in the future',
+                headers=CORS_HEADERS
+            )
+        
+        return expiration_unix, None
+    except (ValueError, TypeError, OSError) as e:
+        return None, build_error_response(
+            f'Invalid expires_at format. Expected UNIX timestamp (integer): {str(e)}',
+            headers=CORS_HEADERS
+        )
+
+
 def _handle_healthcheck():
     """Handle healthcheck action."""
     return build_response(200, {
@@ -87,48 +175,17 @@ def _handle_healthcheck():
     }, CORS_HEADERS)
 
 
-def _handle_create_secret(event, vault_manager):
-    """Handle secret creation action."""
-    secret_value = event.get('secret')
-    password = event.get('password')
-    expires_at = event.get('expires_at')  # Optional expiration timestamp (UNIX timestamp)
+def _encrypt_secret_layers(secret_value, password):
+    """
+    Apply encryption layers to secret value.
     
-    if not secret_value:
-        return build_error_response(
-            'Missing required field: secret',
-            headers=CORS_HEADERS
-        )
-    
-    # Validate expires_at if provided
-    expiration_datetime = None
-    expiration_unix = None
-    if expires_at:
-        try:
-            # Parse UNIX timestamp (integer or string)
-            expiration_unix = int(expires_at)
-            # OSError can be raised for timestamps outside platform's valid range
-            # (typically 1970-2038 on 32-bit systems, much larger on 64-bit systems)
-            expiration_datetime = datetime.fromtimestamp(expiration_unix, tz=timezone.utc)
-            
-            # Ensure the expiration is in the future
-            now = datetime.now(timezone.utc)
-            if expiration_datetime <= now:
-                return build_error_response(
-                    'expires_at must be in the future',
-                    headers=CORS_HEADERS
-                )
-        except (ValueError, TypeError, OSError) as e:
-            return build_error_response(
-                f'Invalid expires_at format. Expected UNIX timestamp (integer): {str(e)}',
-                headers=CORS_HEADERS
-            )
-    
-    # Generate UUID for the secret
-    secret_uuid = str(uuid.uuid4())
-    
-    # Track encryption type for metadata
-    # Options: "secret_key_encrypted" (system-level only), "secret_key_password_encrypted" (system + user password)
-    # Note: "plaintext" and "encrypted" are legacy values for backward compatibility
+    Args:
+        secret_value: Plain text secret
+        password: Optional user password
+        
+    Returns:
+        tuple: (encrypted_value, encryption_type, error_response)
+    """
     encryption_type = "secret_key_encrypted"
     
     # First layer: Optional user password encryption
@@ -137,7 +194,7 @@ def _handle_create_secret(event, vault_manager):
             secret_value = encrypt_secret(secret_value, password)
             encryption_type = "secret_key_password_encrypted"
         except Exception as e:
-            return build_response(500, {
+            return None, None, build_response(500, {
                 'error': f'Password encryption failed: {str(e)}'
             }, CORS_HEADERS)
     
@@ -145,25 +202,57 @@ def _handle_create_secret(event, vault_manager):
     try:
         secret_value = _encrypt_with_secret_key(secret_value)
     except Exception as e:
-        return build_response(500, {
+        return None, None, build_response(500, {
             'error': f'System encryption failed: {str(e)}'
         }, CORS_HEADERS)
     
-    # Store secret in Key Vault
+    return secret_value, encryption_type, None
+
+
+def _store_secret_with_metadata(vault_manager, secret_uuid, secret_value, encryption_type, expiration_unix):
+    """
+    Store secret and its metadata in vault.
+    
+    Args:
+        vault_manager: VaultManager instance
+        secret_uuid: UUID for the secret
+        secret_value: Encrypted secret value
+        encryption_type: Type of encryption applied
+        expiration_unix: Optional expiration timestamp
+    """
     vault_manager.set_secret(secret_uuid, secret_value)
+    vault_manager.set_secret(f"{secret_uuid}-metadata", encryption_type)
     
-    # Store encryption metadata as a separate secret
-    # Using a naming convention: {uuid}-metadata
-    metadata_key = f"{secret_uuid}-metadata"
-    vault_manager.set_secret(metadata_key, encryption_type)
-    
-    # Store expiration metadata if provided
     if expiration_unix:
-        expires_key = f"{secret_uuid}-expires"
-        # Store as UNIX timestamp string for consistency
-        vault_manager.set_secret(expires_key, str(expiration_unix))
+        vault_manager.set_secret(f"{secret_uuid}-expires", str(expiration_unix))
+
+
+def _handle_create_secret(event, vault_manager):
+    """Handle secret creation action."""
+    secret_value = event.get('secret')
+    password = event.get('password')
+    expires_at = event.get('expires_at')
     
-    # Return success response with UUID
+    if not secret_value:
+        return build_error_response('Missing required field: secret', headers=CORS_HEADERS)
+    
+    # Validate expiration time
+    expiration_unix, error = _validate_expiration_time(expires_at)
+    if error:
+        return error
+    
+    # Generate UUID
+    secret_uuid = str(uuid.uuid4())
+    
+    # Encrypt secret with multi-layer encryption
+    encrypted_value, encryption_type, error = _encrypt_secret_layers(secret_value, password)
+    if error:
+        return error
+    
+    # Store secret and metadata
+    _store_secret_with_metadata(vault_manager, secret_uuid, encrypted_value, encryption_type, expiration_unix)
+    
+    # Build response
     response_data = {
         'uuid': secret_uuid,
         'message': 'Secret created successfully'
@@ -174,140 +263,153 @@ def _handle_create_secret(event, vault_manager):
     return build_response(201, response_data, CORS_HEADERS)
 
 
+def _get_encryption_metadata(vault_manager, secret_uuid):
+    """
+    Get encryption metadata for a secret.
+    
+    Args:
+        vault_manager: VaultManager instance
+        secret_uuid: UUID of the secret
+        
+    Returns:
+        Encryption type string or None
+    """
+    try:
+        return vault_manager.get_secret(f"{secret_uuid}-metadata")
+    except Exception:
+        return None
+
+
+def _decrypt_secret_layers(secret_value, encryption_type, password):
+    """
+    Decrypt secret based on encryption type.
+    
+    Args:
+        secret_value: Encrypted secret
+        encryption_type: Type of encryption applied
+        password: Optional user password
+        
+    Returns:
+        tuple: (decrypted_value, error_response)
+    """
+    # New encryption scheme with SECRET_KEY
+    if encryption_type in ["secret_key_encrypted", "secret_key_password_encrypted"]:
+        try:
+            secret_value = _decrypt_with_secret_key(secret_value)
+        except Exception as e:
+            return None, build_response(500, {'error': f'System decryption failed: {str(e)}'}, CORS_HEADERS)
+        
+        # Decrypt with user password if needed
+        if encryption_type == "secret_key_password_encrypted":
+            if not password:
+                return None, build_response(400, {'error': 'Password required for encrypted secret'}, CORS_HEADERS)
+            try:
+                secret_value = decrypt_secret(secret_value, password)
+            except ValueError as e:
+                return None, build_response(400, {'error': f'Decryption failed: {str(e)}'}, CORS_HEADERS)
+    
+    # Legacy encryption scheme
+    elif encryption_type == "encrypted":
+        if not password:
+            return None, build_response(400, {'error': 'Password required for encrypted secret'}, CORS_HEADERS)
+        try:
+            secret_value = decrypt_secret(secret_value, password)
+        except ValueError as e:
+            return None, build_response(400, {'error': f'Decryption failed: {str(e)}'}, CORS_HEADERS)
+    
+    elif encryption_type == "plaintext":
+        pass  # No decryption needed
+    
+    # Unknown metadata - use heuristic
+    else:
+        if is_encrypted(secret_value):
+            if not password:
+                return None, build_response(400, {'error': 'Password required for encrypted secret'}, CORS_HEADERS)
+            try:
+                secret_value = decrypt_secret(secret_value, password)
+            except ValueError as e:
+                return None, build_response(400, {'error': f'Decryption failed: {str(e)}'}, CORS_HEADERS)
+    
+    return secret_value, None
+
+
 def _handle_retrieve_secret(event, vault_manager):
     """Handle secret retrieval and deletion action."""
     secret_uuid = event.get('uuid')
     password = event.get('password')
     
     if not secret_uuid:
-        return build_error_response(
-            'Missing required field: uuid',
-            headers=CORS_HEADERS
-        )
+        return build_error_response('Missing required field: uuid', headers=CORS_HEADERS)
     
     # Check if secret exists
     if not vault_manager.secret_exists(secret_uuid):
-        return build_response(404, {
-            'error': 'Secret not found or already accessed'
-        }, CORS_HEADERS)
+        return build_response(404, {'error': 'Secret not found or already accessed'}, CORS_HEADERS)
     
-    # Check if secret has expired
-    expires_key = f"{secret_uuid}-expires"
-    try:
-        expires_at_str = vault_manager.get_secret(expires_key)
-        expires_at_unix = int(expires_at_str)
-        expires_at = datetime.fromtimestamp(expires_at_unix, tz=timezone.utc)
-        now = datetime.now(timezone.utc)
-        
-        if now >= expires_at:
-            # Secret has expired - delete it and all metadata
-            vault_manager.delete_secret(secret_uuid)
-            try:
-                vault_manager.delete_secret(f"{secret_uuid}-metadata")
-            except Exception:
-                pass
-            try:
-                vault_manager.delete_secret(expires_key)
-            except Exception:
-                pass
-            
-            return build_response(410, {
-                'error': 'Secret has expired and has been deleted',
-                'expired_at': expires_at_unix
-            }, CORS_HEADERS)
-    except Exception:
-        # No expiration metadata means secret doesn't expire
-        pass
+    # Check expiration
+    expiration_error = _check_expiration(vault_manager, secret_uuid)
+    if expiration_error:
+        return expiration_error
     
-    # Check metadata to determine encryption type
-    metadata_key = f"{secret_uuid}-metadata"
-    encryption_type = None
-    try:
-        encryption_type = vault_manager.get_secret(metadata_key)
-    except Exception:
-        # If metadata doesn't exist, fall back to heuristic check for backward compatibility
-        pass
-    
-    # Retrieve the secret value
+    # Get encryption metadata and secret value
+    encryption_type = _get_encryption_metadata(vault_manager, secret_uuid)
     secret_value = vault_manager.get_secret(secret_uuid)
     
-    # Decrypt based on encryption type
-    if encryption_type in ["secret_key_encrypted", "secret_key_password_encrypted"]:
-        # New encryption scheme: First decrypt with SECRET_KEY (system-level)
-        try:
-            secret_value = _decrypt_with_secret_key(secret_value)
-        except Exception as e:
-            return build_response(500, {
-                'error': f'System decryption failed: {str(e)}'
-            }, CORS_HEADERS)
-        
-        # Then decrypt with user password if it was password-encrypted
-        if encryption_type == "secret_key_password_encrypted":
-            if not password:
-                # Do NOT delete the secret - allow retry
-                return build_response(400, {
-                    'error': 'Password required for encrypted secret'
-                }, CORS_HEADERS)
-            
-            try:
-                secret_value = decrypt_secret(secret_value, password)
-            except ValueError as e:
-                # Do NOT delete the secret on wrong password - allow retry
-                return build_response(400, {
-                    'error': f'Decryption failed: {str(e)}'
-                }, CORS_HEADERS)
+    # Decrypt secret
+    decrypted_value, error = _decrypt_secret_layers(secret_value, encryption_type, password)
+    if error:
+        return error
     
-    elif encryption_type == "encrypted":
-        # Legacy encryption scheme: Only password encryption (backward compatibility)
-        if not password:
-            return build_response(400, {
-                'error': 'Password required for encrypted secret'
-            }, CORS_HEADERS)
-        
-        try:
-            secret_value = decrypt_secret(secret_value, password)
-        except ValueError as e:
-            return build_response(400, {
-                'error': f'Decryption failed: {str(e)}'
-            }, CORS_HEADERS)
+    # Delete secret and all metadata (one-time access)
+    _delete_secret_and_metadata(vault_manager, secret_uuid)
     
-    elif encryption_type == "plaintext":
-        # Legacy plaintext scheme: No encryption (backward compatibility)
-        pass
-    
-    else:
-        # Unknown or missing metadata - try heuristic check for backward compatibility
-        if is_encrypted(secret_value):
-            if not password:
-                return build_response(400, {
-                    'error': 'Password required for encrypted secret'
-                }, CORS_HEADERS)
-            
-            try:
-                secret_value = decrypt_secret(secret_value, password)
-            except ValueError as e:
-                return build_response(400, {
-                    'error': f'Decryption failed: {str(e)}'
-                }, CORS_HEADERS)
-    
-    # Delete the secret and all metadata (one-time access)
-    vault_manager.delete_secret(secret_uuid)
-    try:
-        vault_manager.delete_secret(metadata_key)
-    except Exception:
-        # Metadata might not exist for old secrets
-        pass
-    try:
-        vault_manager.delete_secret(expires_key)
-    except Exception:
-        # Expiration metadata might not exist
-        pass
-    
-    # Return success response with secret value
     return build_response(200, {
-        'secret': secret_value,
+        'secret': decrypted_value,
         'message': 'Secret retrieved and deleted successfully'
     }, CORS_HEADERS)
+
+
+def _get_expiration_info(vault_manager, secret_uuid):
+    """
+    Get expiration information for a secret.
+    
+    Args:
+        vault_manager: VaultManager instance
+        secret_uuid: UUID of the secret
+        
+    Returns:
+        UNIX timestamp or None
+    """
+    try:
+        expires_at_str = vault_manager.get_secret(f"{secret_uuid}-expires")
+        return int(expires_at_str)
+    except Exception:
+        return None
+
+
+def _check_password_requirement(vault_manager, secret_uuid):
+    """
+    Check if secret requires a password for decryption.
+    
+    Args:
+        vault_manager: VaultManager instance
+        secret_uuid: UUID of the secret
+        
+    Returns:
+        bool: True if password is required
+    """
+    metadata_value = _get_encryption_metadata(vault_manager, secret_uuid)
+    
+    if metadata_value in ["encrypted", "secret_key_password_encrypted"]:
+        return True
+    elif metadata_value in ["plaintext", "secret_key_encrypted"]:
+        return False
+    
+    # Fallback to heuristic for backward compatibility
+    try:
+        secret_value = vault_manager.get_secret(secret_uuid)
+        return is_encrypted(secret_value)
+    except Exception:
+        return False
 
 
 def _handle_check_secret(event, vault_manager):
@@ -315,72 +417,76 @@ def _handle_check_secret(event, vault_manager):
     secret_uuid = event.get('uuid')
     
     if not secret_uuid:
-        return build_error_response(
-            'Missing required field: uuid',
-            headers=CORS_HEADERS
-        )
+        return build_error_response('Missing required field: uuid', headers=CORS_HEADERS)
     
     # Check if secret exists
     if not vault_manager.secret_exists(secret_uuid):
-        return build_response(404, {
-            'error': 'Secret not found or already accessed'
-        }, CORS_HEADERS)
+        return build_response(404, {'error': 'Secret not found or already accessed'}, CORS_HEADERS)
     
-    # Check if secret has expired
-    expires_key = f"{secret_uuid}-expires"
-    expires_at_unix = None
-    is_expired = False
-    try:
-        expires_at_str = vault_manager.get_secret(expires_key)
-        expires_at_unix = int(expires_at_str)
-        expires_at = datetime.fromtimestamp(expires_at_unix, tz=timezone.utc)
-        now = datetime.now(timezone.utc)
-        
-        if now >= expires_at:
-            is_expired = True
-            # Secret has expired - delete it and all metadata
-            vault_manager.delete_secret(secret_uuid)
-            try:
-                vault_manager.delete_secret(f"{secret_uuid}-metadata")
-            except Exception:
-                pass
-            try:
-                vault_manager.delete_secret(expires_key)
-            except Exception:
-                pass
-            
-            return build_response(410, {
-                'error': 'Secret has expired and has been deleted',
-                'expired_at': expires_at_unix
-            }, CORS_HEADERS)
-    except Exception:
-        # No expiration metadata means secret doesn't expire
-        pass
+    # Check expiration
+    expiration_error = _check_expiration(vault_manager, secret_uuid)
+    if expiration_error:
+        return expiration_error
     
-    # Check metadata to determine if secret requires a password (bulletproof method)
-    metadata_key = f"{secret_uuid}-metadata"
-    requires_password = False
-    try:
-        metadata_value = vault_manager.get_secret(metadata_key)
-        # New metadata types: "secret_key_password_encrypted" requires password
-        # "secret_key_encrypted" does not require password (system-level only)
-        # Legacy: "encrypted" requires password, "plaintext" does not
-        if metadata_value in ["encrypted", "secret_key_password_encrypted"]:
-            requires_password = True
-    except Exception:
-        # If metadata doesn't exist, fall back to heuristic check for backward compatibility
-        secret_value = vault_manager.get_secret(secret_uuid)
-        requires_password = is_encrypted(secret_value)
+    # Get password requirement and expiration info
+    requires_password = _check_password_requirement(vault_manager, secret_uuid)
+    expires_at_unix = _get_expiration_info(vault_manager, secret_uuid)
     
-    # Return check result
+    # Build response
     response_data = {
-        'encrypted': requires_password,  # For backward compatibility with frontends
+        'encrypted': requires_password,
         'requires_password': requires_password
     }
     if expires_at_unix:
         response_data['expires_at'] = expires_at_unix
     
     return build_response(200, response_data, CORS_HEADERS)
+
+
+def _validate_action(action):
+    """
+    Validate the action parameter.
+    
+    Args:
+        action: Action string from event
+        
+    Returns:
+        Error response or None if valid
+    """
+    if not action or action not in ['create', 'retrieve', 'check']:
+        return build_error_response(
+            'Invalid or missing action. Must be "create", "retrieve", "check", or "healthcheck"',
+            headers=CORS_HEADERS
+        )
+    return None
+
+
+def _validate_turnstile(event, original_event, context):
+    """
+    Validate CloudFlare Turnstile token.
+    
+    Args:
+        event: Parsed event
+        original_event: Original event
+        context: Lambda context
+        
+    Returns:
+        Error response or None if valid
+    """
+    turnstile_token = event.get('turnstile_token')
+    
+    if not turnstile_token:
+        return build_error_response(
+            'Missing required field: turnstile_token (bot protection enabled)',
+            headers=CORS_HEADERS
+        )
+    
+    remoteip = extract_remote_ip(original_event, context)
+    
+    if not validate_turnstile(turnstile_token, remoteip):
+        return build_response(403, {'error': 'Invalid or expired Turnstile token'}, CORS_HEADERS)
+    
+    return None
 
 
 def lambda_handler(event, context):
@@ -458,16 +564,14 @@ def lambda_handler(event, context):
     Returns:
         dict: Response with statusCode and body containing operation result
     """
-    # Parse event first to handle string inputs
     original_event = event
     event = parse_lambda_event(event)
     
-    # Handle OPTIONS preflight request
-    http_method = extract_http_method(original_event)
-    if http_method == "OPTIONS":
+    # Handle OPTIONS preflight
+    if extract_http_method(original_event) == "OPTIONS":
         return build_response(200, {"message": "CORS preflight OK"}, CORS_HEADERS)
     
-    # Validate required fields
+    # Validate event body
     if not event:
         return build_error_response(
             'Missing event body. Expected fields: action, secret (for create), uuid (for retrieve/check)',
@@ -476,36 +580,21 @@ def lambda_handler(event, context):
     
     action = event.get('action')
     
-    # Handle healthcheck action (no turnstile validation required)
+    # Handle healthcheck (no turnstile required)
     if action == 'healthcheck':
         return _handle_healthcheck()
     
     # Validate action
-    if not action or action not in ['create', 'retrieve', 'check']:
-        return build_error_response(
-            'Invalid or missing action. Must be "create", "retrieve", "check", or "healthcheck"',
-            headers=CORS_HEADERS
-        )
+    error = _validate_action(action)
+    if error:
+        return error
     
-    # Validate CloudFlare Turnstile token (required for create/retrieve/check)
-    turnstile_token = event.get('turnstile_token')
-    
-    if not turnstile_token:
-        return build_error_response(
-            'Missing required field: turnstile_token (bot protection enabled)',
-            headers=CORS_HEADERS
-        )
-    
-    # Extract remote IP and validate turnstile
-    remoteip = extract_remote_ip(original_event, context)
-    
-    if not validate_turnstile(turnstile_token, remoteip):
-        return build_response(403, {
-            'error': 'Invalid or expired Turnstile token'
-        }, CORS_HEADERS)
+    # Validate turnstile token
+    error = _validate_turnstile(event, original_event, context)
+    if error:
+        return error
     
     try:
-        # Initialize VaultManager with Azure Key Vault
         vault_manager = VaultManager()
         
         if action == 'create':
@@ -516,10 +605,8 @@ def lambda_handler(event, context):
             return _handle_check_secret(event, vault_manager)
         
     except Exception as e:
-        # Return error response
-        error_details = {
+        return build_response(500, {
             'error': str(e),
             'type': type(e).__name__,
             'traceback': traceback.format_exc()
-        }
-        return build_response(500, error_details, CORS_HEADERS)
+        }, CORS_HEADERS)
