@@ -59,13 +59,73 @@ def _decrypt_with_secret_key(data: str) -> str:
     return decrypt_secret(data, secret_key)
 
 
-# CORS headers - origin is configurable via CORS_ORIGIN environment variable
+# CORS configuration
+# Default allowed origins - supports multiple origins
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://secrets.merabytes.com",
+    "https://app.merabytes.com",
+    "https://local.merabytes.com"
+]
+
+# Allow custom origins via CORS_ORIGIN environment variable (comma-separated)
+CORS_ORIGIN_ENV = os.environ.get("CORS_ORIGIN", "")
+if CORS_ORIGIN_ENV:
+    ALLOWED_ORIGINS = [origin.strip() for origin in CORS_ORIGIN_ENV.split(",")]
+else:
+    ALLOWED_ORIGINS = DEFAULT_ALLOWED_ORIGINS
+
+# Initialize CORS_HEADERS with default (will be updated per request)
 CORS_HEADERS = {
-    "Access-Control-Allow-Origin": os.environ.get("CORS_ORIGIN", "https://secrets.merabytes.com"),
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS[0],
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Content-Type": "application/json"
 }
+
+
+def _get_cors_headers(origin=None):
+    """
+    Get CORS headers with appropriate origin.
+    
+    If origin is provided and is in the allowed list, use it.
+    Otherwise, use the first allowed origin as default.
+    
+    Args:
+        origin: Origin header from the request
+        
+    Returns:
+        dict: CORS headers
+    """
+    allowed_origin = ALLOWED_ORIGINS[0]  # Default to first allowed origin
+    
+    if origin and origin in ALLOWED_ORIGINS:
+        allowed_origin = origin
+    
+    return {
+        "Access-Control-Allow-Origin": allowed_origin,
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Content-Type": "application/json"
+    }
+
+
+def _extract_origin(event):
+    """
+    Extract the Origin header from the Lambda event.
+    
+    Args:
+        event: Lambda event object
+        
+    Returns:
+        str: Origin header value or None
+    """
+    # Try to get headers from the event
+    headers = event.get('headers', {})
+    if not headers:
+        return None
+    
+    # Headers can be lowercase or capitalized depending on the source
+    return headers.get('origin') or headers.get('Origin')
 
 
 def _get_version():
@@ -542,7 +602,8 @@ def lambda_handler(event, context):
     - SECRET_KEY: Additional encryption key for enhanced security (auto-generated during deployment)
     
     Environment variables optional:
-    - CORS_ORIGIN: CORS origin URL (default: https://secrets.merabytes.com)
+    - CORS_ORIGIN: Comma-separated list of allowed CORS origins
+      (default: https://secrets.merabytes.com,https://app.merabytes.com,https://local.merabytes.com)
     
     Multi-layer encryption:
     - All secrets are encrypted with SECRET_KEY (system-level encryption, always applied)
@@ -564,7 +625,14 @@ def lambda_handler(event, context):
     Returns:
         dict: Response with statusCode and body containing operation result
     """
+    global CORS_HEADERS
+    
     original_event = event
+    
+    # Extract origin from request and set CORS headers dynamically
+    origin = _extract_origin(original_event)
+    CORS_HEADERS = _get_cors_headers(origin)
+    
     event = parse_lambda_event(event)
     
     # Handle OPTIONS preflight
