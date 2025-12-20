@@ -431,7 +431,7 @@ The service supports multi-region deployment to AWS Lambda across multiple geogr
    - `AWS_ACCESS_KEY_ID` - AWS access key for deployment
    - `AWS_SECRET_ACCESS_KEY` - AWS secret key for deployment
    - `CF_SECRET_KEY` - CloudFlare Turnstile secret key (optional, for bot protection)
-   - `CORS_ORIGIN` - CORS origin URL (optional, defaults to `https://secrets.merabytes.com`)
+   - `CORS_ORIGIN` - Comma-separated list of allowed CORS origins (optional, defaults to secrets.merabytes.com, app.merabytes.com, and local.merabytes.com)
 
 ### Automated Deployment
 
@@ -587,30 +587,50 @@ aws lambda update-function-configuration \
 
 ## CORS Configuration
 
-The Lambda function supports Cross-Origin Resource Sharing (CORS) to allow web applications to interact with the secrets API. The CORS origin URL can be configured through the `CORS_ORIGIN` environment variable.
+The Lambda function supports Cross-Origin Resource Sharing (CORS) to allow web applications to interact with the secrets API. The service now supports **multiple allowed origins** with dynamic origin matching.
 
 ### Configuration
 
-- **Default**: If not specified, defaults to `https://secrets.merabytes.com`
-- **Custom**: Set `CORS_ORIGIN` environment variable to your frontend URL
+- **Default Origins**: If not specified, the service allows requests from:
+  - `https://secrets.merabytes.com`
+  - `https://app.merabytes.com`
+  - `https://local.merabytes.com`
 
-**Example:**
+- **Custom Origins**: Set `CORS_ORIGIN` environment variable to a comma-separated list of allowed origins
+- **Dynamic Matching**: The service inspects the `Origin` header in each request and returns it in the response if it's in the allowed list
+
+**Example - Single origin:**
 ```bash
-# Set custom CORS origin
+# Set custom CORS origin (single domain)
 aws lambda update-function-configuration \
   --function-name AcidoSecrets \
   --environment "Variables={...,CORS_ORIGIN=https://myapp.example.com}"
 ```
 
+**Example - Multiple origins:**
+```bash
+# Set custom CORS origins (multiple domains, comma-separated)
+aws lambda update-function-configuration \
+  --function-name AcidoSecrets \
+  --environment "Variables={...,CORS_ORIGIN=https://app1.example.com,https://app2.example.com,https://local.example.com}"
+```
+
 **In GitHub Actions:**
-Add `CORS_ORIGIN` to your repository secrets to configure it during deployment.
+Add `CORS_ORIGIN` to your repository secrets to configure it during deployment. Use a comma-separated list for multiple origins.
 
 ### CORS Headers
 
 The service responds with the following CORS headers:
-- `Access-Control-Allow-Origin`: Configurable via `CORS_ORIGIN` (default: `https://secrets.merabytes.com`)
+- `Access-Control-Allow-Origin`: Dynamically set to match the request origin if it's in the allowed list (defaults to first allowed origin if no match)
 - `Access-Control-Allow-Methods`: `POST, OPTIONS`
 - `Access-Control-Allow-Headers`: `Content-Type`
+
+### How It Works
+
+1. The service extracts the `Origin` header from incoming requests
+2. If the origin is in the allowed list, it's returned in the `Access-Control-Allow-Origin` response header
+3. If the origin is not in the allowed list (or missing), the first allowed origin is used as the default
+4. This allows multiple frontend applications to interact with the same Lambda function while maintaining security
 
 ## CloudFlare Turnstile Integration
 
