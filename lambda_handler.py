@@ -70,7 +70,11 @@ DEFAULT_ALLOWED_ORIGINS = [
 # Allow custom origins via CORS_ORIGIN environment variable (comma-separated)
 CORS_ORIGIN_ENV = os.environ.get("CORS_ORIGIN", "")
 if CORS_ORIGIN_ENV:
-    ALLOWED_ORIGINS = [origin.strip() for origin in CORS_ORIGIN_ENV.split(",")]
+    # Parse comma-separated origins and filter out empty strings
+    ALLOWED_ORIGINS = [origin.strip() for origin in CORS_ORIGIN_ENV.split(",") if origin.strip()]
+    # If parsing resulted in an empty list, fall back to defaults
+    if not ALLOWED_ORIGINS:
+        ALLOWED_ORIGINS = DEFAULT_ALLOWED_ORIGINS
 else:
     ALLOWED_ORIGINS = DEFAULT_ALLOWED_ORIGINS
 
@@ -112,6 +116,7 @@ def _get_cors_headers(origin=None):
 def _extract_origin(event):
     """
     Extract the Origin header from the Lambda event.
+    Uses case-insensitive header lookup.
     
     Args:
         event: Lambda event object
@@ -124,8 +129,12 @@ def _extract_origin(event):
     if not headers:
         return None
     
-    # Headers can be lowercase or capitalized depending on the source
-    return headers.get('origin') or headers.get('Origin')
+    # HTTP header names are case-insensitive - search case-insensitively
+    for key, value in headers.items():
+        if key.lower() == 'origin':
+            return value
+    
+    return None
 
 
 def _get_version():
@@ -625,6 +634,8 @@ def lambda_handler(event, context):
     Returns:
         dict: Response with statusCode and body containing operation result
     """
+    # Note: Lambda execution contexts are single-threaded and handle one request at a time,
+    # so modifying the global CORS_HEADERS here is safe and doesn't cause race conditions.
     global CORS_HEADERS
     
     original_event = event
