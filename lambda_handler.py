@@ -24,6 +24,15 @@ from acido.utils.lambda_utils import (
 from acido.utils.crypto_utils import encrypt_secret, decrypt_secret, is_encrypted
 from acido.utils.turnstile_utils import validate_turnstile
 
+# Azure Key Vault Standard SKU limit: 25 KB per secret value.
+# PQC encryption (ML-KEM-768 + AES-256-GCM) adds ~1.46 KB fixed overhead
+# plus ~36% base64 expansion. Empirically:
+#   16 KB plaintext -> 22.8 KB encrypted (safe margin under 25 KB)
+#   20 KB plaintext -> 28.1 KB encrypted (EXCEEDS limit)
+AZ_KV_SECRET_LIMIT_BYTES   = 25 * 1024   # 25 KB hard limit (Azure KV Standard SKU)
+MAX_SECRET_PLAINTEXT_BYTES = 16 * 1024   # 16 KB -> ~22.8 KB encrypted (2.2 KB headroom)
+MAX_SECRET_PLAINTEXT_CHARS = MAX_SECRET_PLAINTEXT_BYTES
+
 
 def _encrypt_with_secret_key(data: str) -> str:
     """
@@ -304,6 +313,16 @@ def _handle_create_secret(event, vault_manager):
     
     if not secret_value:
         return build_error_response('Missing required field: secret', headers=CORS_HEADERS)
+
+    # Enforce Azure Key Vault secret size limit (Standard SKU: 25 KB)
+    # PQC encryption adds ~1.5 KB overhead so we cap plaintext at 20 KB
+    secret_bytes = secret_value.encode('utf-8') if isinstance(secret_value, str) else secret_value
+    if len(secret_bytes) > MAX_SECRET_PLAINTEXT_BYTES:
+        return build_error_response(
+            f'Secret too large: {len(secret_bytes):,} bytes exceeds the {MAX_SECRET_PLAINTEXT_BYTES // 1024} KB limit '
+            f'(Azure Key Vault Standard SKU: 25 KB max, encryption overhead reserved)',
+            headers=CORS_HEADERS
+        )
     
     # Validate expiration time
     expiration_unix, error = _validate_expiration_time(expires_at)
