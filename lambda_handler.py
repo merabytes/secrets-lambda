@@ -21,7 +21,7 @@ from utils.lambda_utils import (
     extract_http_method,
     extract_remote_ip
 )
-from utils.crypto_utils import encrypt_secret, decrypt_secret, is_encrypted
+from utils.crypto_utils import encrypt_secret, decrypt_secret
 from utils.turnstile_utils import validate_turnstile
 
 # Azure Key Vault Standard SKU limit: 25 KB per secret value.
@@ -371,53 +371,31 @@ def _get_encryption_metadata(vault_manager, secret_uuid):
 def _decrypt_secret_layers(secret_value, encryption_type, password):
     """
     Decrypt secret based on encryption type.
-    
+
     Args:
         secret_value: Encrypted secret
         encryption_type: Type of encryption applied
         password: Optional user password
-        
+
     Returns:
         tuple: (decrypted_value, error_response)
     """
-    # New encryption scheme with SECRET_KEY
-    if encryption_type in ["secret_key_encrypted", "secret_key_password_encrypted"]:
-        try:
-            secret_value = _decrypt_with_secret_key(secret_value)
-        except Exception as e:
-            return None, build_response(500, {'error': f'System decryption failed: {str(e)}'}, CORS_HEADERS)
-        
-        # Decrypt with user password if needed
-        if encryption_type == "secret_key_password_encrypted":
-            if not password:
-                return None, build_response(400, {'error': 'Password required for encrypted secret'}, CORS_HEADERS)
-            try:
-                secret_value = decrypt_secret(secret_value, password)
-            except ValueError as e:
-                return None, build_response(400, {'error': f'Decryption failed: {str(e)}'}, CORS_HEADERS)
-    
-    # Legacy encryption scheme
-    elif encryption_type == "encrypted":
+    if encryption_type not in ["secret_key_encrypted", "secret_key_password_encrypted"]:
+        return None, build_response(500, {'error': f'Unsupported encryption type: {encryption_type}'}, CORS_HEADERS)
+
+    try:
+        secret_value = _decrypt_with_secret_key(secret_value)
+    except Exception as e:
+        return None, build_response(500, {'error': f'System decryption failed: {str(e)}'}, CORS_HEADERS)
+
+    if encryption_type == "secret_key_password_encrypted":
         if not password:
             return None, build_response(400, {'error': 'Password required for encrypted secret'}, CORS_HEADERS)
         try:
             secret_value = decrypt_secret(secret_value, password)
         except ValueError as e:
             return None, build_response(400, {'error': f'Decryption failed: {str(e)}'}, CORS_HEADERS)
-    
-    elif encryption_type == "plaintext":
-        pass  # No decryption needed
-    
-    # Unknown metadata - use heuristic
-    else:
-        if is_encrypted(secret_value):
-            if not password:
-                return None, build_response(400, {'error': 'Password required for encrypted secret'}, CORS_HEADERS)
-            try:
-                secret_value = decrypt_secret(secret_value, password)
-            except ValueError as e:
-                return None, build_response(400, {'error': f'Decryption failed: {str(e)}'}, CORS_HEADERS)
-    
+
     return secret_value, None
 
 
@@ -477,27 +455,12 @@ def _get_expiration_info(vault_manager, secret_uuid):
 def _check_password_requirement(vault_manager, secret_uuid):
     """
     Check if secret requires a password for decryption.
-    
-    Args:
-        vault_manager: VaultManager instance
-        secret_uuid: UUID of the secret
-        
+
     Returns:
         bool: True if password is required
     """
     metadata_value = _get_encryption_metadata(vault_manager, secret_uuid)
-    
-    if metadata_value in ["encrypted", "secret_key_password_encrypted"]:
-        return True
-    elif metadata_value in ["plaintext", "secret_key_encrypted"]:
-        return False
-    
-    # Fallback to heuristic for backward compatibility
-    try:
-        secret_value = vault_manager.get_secret(secret_uuid)
-        return is_encrypted(secret_value)
-    except Exception:
-        return False
+    return metadata_value == "secret_key_password_encrypted"
 
 
 def _handle_check_secret(event, vault_manager):
@@ -552,28 +515,29 @@ def _validate_action(action):
 def _validate_turnstile(event, original_event, context):
     """
     Validate CloudFlare Turnstile token.
-    
-    Args:
-        event: Parsed event
-        original_event: Original event
-        context: Lambda context
-        
+    Bypass: if turnstile_token equals SECRET_KEY, skip CF validation (golden token for testing).
+
     Returns:
         Error response or None if valid
     """
     turnstile_token = event.get('turnstile_token')
-    
+
     if not turnstile_token:
         return build_error_response(
             'Missing required field: turnstile_token (bot protection enabled)',
             headers=CORS_HEADERS
         )
-    
+
+    # Golden token: SECRET_KEY itself bypasses CF validation
+    secret_key = os.environ.get('SECRET_KEY', '')
+    if secret_key and turnstile_token == secret_key:
+        return None
+
     remoteip = extract_remote_ip(original_event, context)
-    
+
     if not validate_turnstile(turnstile_token, remoteip):
         return build_response(403, {'error': 'Invalid or expired Turnstile token'}, CORS_HEADERS)
-    
+
     return None
 
 

@@ -12,41 +12,30 @@ Scheme:
     4. Encode: "PQC:" + base64(kem_ciphertext ‖ nonce ‖ tag ‖ aes_ciphertext)
 
   decrypt(blob, password):
-    1. Detect format prefix ("PQC:" = new, else = legacy AES-CBC)
+    1. Verify "PQC:" prefix
     2. Re-derive keypair from password (same HKDF seed → same sk)
     3. Decapsulate kem_ciphertext → shared_key
     4. Decrypt with AES-256-GCM(shared_key, nonce, tag)
-
-Legacy AES-256-CBC blobs (no prefix) are still decryptable for backwards
-compatibility but new secrets are always written in PQC format.
 """
 
 import os
 import base64
-import hashlib
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-# ── PQC imports ───────────────────────────────────────────────────────────────
 try:
     from kyber_py.kyber import Kyber768
     _PQC_AVAILABLE = True
 except ImportError:
     _PQC_AVAILABLE = False
 
-# ── Format constants ──────────────────────────────────────────────────────────
 _PQC_PREFIX       = "PQC:"
 _KEM_CT_LEN       = 1088   # ML-KEM-768 ciphertext bytes
 _NONCE_LEN        = 12     # AES-GCM nonce
 _TAG_LEN          = 16     # AES-GCM tag
 _MIN_PQC_BLOB_LEN = _KEM_CT_LEN + _NONCE_LEN + _TAG_LEN  # 1116 bytes minimum
-
-# ── Legacy AES-CBC constants (for backwards-compat decryption) ───────────────
-_AES_SALT_LEN  = 16
-_AES_IV_LEN    = 16
-_MIN_AES_BLOB  = _AES_SALT_LEN + _AES_IV_LEN + 16  # 48 bytes
 
 
 def _derive_kem_seed(password: str) -> bytes:
@@ -109,11 +98,10 @@ def encrypt_secret(secret_value: str, password: str) -> str:
 
 def decrypt_secret(encrypted_value: str, password: str) -> str:
     """
-    Decrypt a secret.  Handles both PQC (ML-KEM-768 + AES-GCM) and
-    legacy AES-256-CBC formats.
+    Decrypt a PQC (ML-KEM-768 + AES-256-GCM) encrypted secret.
 
     Args:
-        encrypted_value: Output of encrypt_secret() or a legacy AES-CBC blob.
+        encrypted_value: Output of encrypt_secret() — must start with "PQC:".
         password:        The password used during encryption.
 
     Returns:
@@ -122,10 +110,9 @@ def decrypt_secret(encrypted_value: str, password: str) -> str:
     Raises:
         ValueError: Wrong password, corrupted data, or unsupported format.
     """
-    if encrypted_value.startswith(_PQC_PREFIX):
-        return _decrypt_pqc(encrypted_value[len(_PQC_PREFIX):], password)
-    else:
-        return _decrypt_legacy_aes(encrypted_value, password)
+    if not encrypted_value.startswith(_PQC_PREFIX):
+        raise ValueError("Unsupported format: only PQC-encrypted secrets are supported.")
+    return _decrypt_pqc(encrypted_value[len(_PQC_PREFIX):], password)
 
 
 def _decrypt_pqc(b64_blob: str, password: str) -> str:
@@ -168,76 +155,14 @@ def _decrypt_pqc(b64_blob: str, password: str) -> str:
     except UnicodeDecodeError:
         raise ValueError("Decrypted data is not valid UTF-8")
 
-
-def _decrypt_legacy_aes(encrypted_value: str, password: str) -> str:
-    """Decrypt a legacy AES-256-CBC blob (no 'PQC:' prefix). Backwards compat only."""
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-    try:
-        encrypted_data = base64.b64decode(encrypted_value.encode())
-    except Exception:
-        raise ValueError("Invalid legacy blob: base64 decode failed")
-
-    if len(encrypted_data) < _MIN_AES_BLOB:
-        raise ValueError("Invalid legacy encrypted data — too short")
-
-    salt       = encrypted_data[:16]
-    iv         = encrypted_data[16:32]
-    ciphertext = encrypted_data[32:]
-
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=100000,
-        backend=default_backend(),
-    )
-    key = kdf.derive(password.encode())
-
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ciphertext) + decryptor.finalize()
-
-    if not padded:
-        raise ValueError("Empty decrypted data")
-
-    padding_length = padded[-1]
-    if padding_length > 16 or padding_length == 0:
-        raise ValueError("Invalid padding — likely wrong password")
-    for i in range(padding_length):
-        if padded[-(i + 1)] != padding_length:
-            raise ValueError("Invalid padding — likely wrong password")
-
-    try:
-        return padded[:-padding_length].decode("utf-8")
-    except UnicodeDecodeError:
-        raise ValueError("Decryption failed: invalid password or corrupted data")
-
-
 def is_encrypted(value: str) -> bool:
-    """
-    Check if a value appears to be an encrypted secret (PQC or legacy AES).
-
-    Returns:
-        bool: True if the value looks like an encrypted blob.
-    """
+    """Check if a value is a PQC-encrypted secret."""
     if not isinstance(value, str):
         return False
-
-    # New PQC format
-    if value.startswith(_PQC_PREFIX):
-        try:
-            raw = base64.b64decode(value[len(_PQC_PREFIX):].encode("ascii"))
-            return len(raw) >= _MIN_PQC_BLOB_LEN
-        except Exception:
-            return False
-
-    # Legacy AES-CBC format
+    if not value.startswith(_PQC_PREFIX):
+        return False
     try:
-        decoded = base64.b64decode(value.encode())
-        if len(decoded) < _MIN_AES_BLOB:
-            return False
-        return (len(decoded) - 32) % 16 == 0
+        raw = base64.b64decode(value[len(_PQC_PREFIX):].encode("ascii"))
+        return len(raw) >= _MIN_PQC_BLOB_LEN
     except Exception:
         return False
