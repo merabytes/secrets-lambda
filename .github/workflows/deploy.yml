@@ -364,15 +364,14 @@ jobs:
       if: steps.parse-config.outputs.has_config == 'true' && steps.check-lambda.outputs.exists == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
       env:
         FUNCTION_URL: ${{ steps.get-function-url.outputs.function_url }}
-        CORS_ORIGIN: ${{ secrets.CORS_ORIGIN }}
       run: |
         if [ -n "$FUNCTION_URL" ] && [ "$FUNCTION_URL" != "No URL configured" ]; then
           echo "=========================================="
           echo "Testing deployed Lambda in ${{ matrix.aws_region }}"
           echo "=========================================="
           
-          # Use configured CORS origin or default
-          ORIGIN_URL="${CORS_ORIGIN:-https://secrets.merabytes.com}"
+          # Use hardcoded default origin — CORS_ORIGIN is not injected as env var
+          ORIGIN_URL="https://secrets.merabytes.com"
           echo "Testing with CORS origin: $ORIGIN_URL"
           
           # Test healthcheck with CORS headers
