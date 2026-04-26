@@ -278,12 +278,6 @@ jobs:
           echo "CloudFlare Turnstile bot protection enabled"
         fi
 
-        if [ -n "${{ secrets.CORS_ORIGIN }}" ]; then
-          ENV_VARS="${ENV_VARS},CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}"
-        else
-          ENV_VARS="${ENV_VARS},CORS_ORIGIN=https://secrets.merabytes.com"
-        fi
-
         aws lambda update-function-configuration \
           --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
           --environment "Variables={${ENV_VARS}}" \
