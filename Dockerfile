@@ -1,6 +1,9 @@
 # Use AWS Lambda Python 3.12 base image
 FROM public.ecr.aws/lambda/python:3.12
 
+# Install git (required to install acido from GitHub)
+RUN dnf install -y git && dnf clean all
+
 # Copy requirements and install Python dependencies
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
