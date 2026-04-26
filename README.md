@@ -31,9 +31,9 @@ This implementation follows the OneTimeSecret pattern where secrets self-destruc
 - **Create Secret**: Store a secret and receive a unique UUID
 - **Retrieve Secret**: Get the secret once using the UUID (auto-deletes after retrieval)
 - **Check Secret**: Check if a secret is encrypted without retrieving it (non-destructive)
-- **Multi-layer Encryption**: Two independent encryption layers for enhanced security
-  - System-level encryption with SECRET_KEY (always applied)
-  - Optional user-level encryption with password
+- **Multi-layer PQC Encryption**: Two independent encryption layers for enhanced security
+  - System-level encryption with SECRET_KEY using ML-KEM-768 + AES-256-GCM (always applied)
+  - Optional user-level encryption with password using ML-KEM-768 + AES-256-GCM
 - **Password Encryption**: Optional client-side password protection for secrets
 - **Time-based Expiration**: Optional expiration time for automatic secret deletion
 - **Secure Storage**: All secrets stored in Azure KeyVault with explicit encryption metadata
@@ -54,15 +54,14 @@ The API provides three main operations:
 When creating a secret, the service stores up to three items in Azure KeyVault:
 - `{uuid}` - The actual secret value (always encrypted with SECRET_KEY, plus optional password encryption)
 - `{uuid}-metadata` - Encryption type marker:
-  - `secret_key_encrypted` - System-level encryption only (no password required)
-  - `secret_key_password_encrypted` - Both system-level and user password encryption
-  - Legacy values: `encrypted` (password only), `plaintext` (no encryption)
+  - `secret_key_encrypted` - System-level PQC encryption only (no password required)
+  - `secret_key_password_encrypted` - Both system-level and user password PQC encryption
 - `{uuid}-expires` - (Optional) UNIX timestamp expiration
 
-**Multi-layer Encryption Process:**
-1. **User Password Layer** (optional): If user provides a password, secret is first encrypted with AES-256
-2. **System SECRET_KEY Layer** (always): Secret is then encrypted with the system-level SECRET_KEY
-3. **Storage**: Doubly-encrypted secret is stored in Azure KeyVault
+**Multi-layer Encryption Process (ML-KEM-768 + AES-256-GCM):**
+1. **User Password Layer** (optional): If user provides a password, secret is first encrypted with ML-KEM-768 + AES-256-GCM
+2. **System SECRET_KEY Layer** (always): Result is then encrypted again with the system-level SECRET_KEY
+3. **Storage**: Doubly-encrypted PQC blob is stored in Azure KeyVault
 
 **Decryption Process:**
 1. **System Layer**: Secret is first decrypted using SECRET_KEY
@@ -142,7 +141,7 @@ Store a new secret and receive a UUID to access it. Optionally encrypt with a pa
 ```
 
 **Notes:**
-- If `password` is provided, the secret is encrypted with AES-256 using PBKDF2 key derivation
+- If `password` is provided, the secret is encrypted with ML-KEM-768 + AES-256-GCM (PQC)
 - The same password must be provided during retrieval to decrypt
 - Metadata is stored to track encryption status (bulletproof detection)
 - If `expires_at` is provided, the secret will automatically expire and be deleted at that time
