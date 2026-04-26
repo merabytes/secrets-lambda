@@ -13,16 +13,16 @@ import os
 import uuid
 import traceback
 from datetime import datetime, timezone
-from acido.azure_utils.VaultManager import VaultManager
-from acido.utils.lambda_utils import (
+from utils.vault_manager import VaultManager
+from utils.lambda_utils import (
     parse_lambda_event,
     build_response,
     build_error_response,
     extract_http_method,
     extract_remote_ip
 )
-from acido.utils.crypto_utils import encrypt_secret, decrypt_secret, is_encrypted
-from acido.utils.turnstile_utils import validate_turnstile
+from utils.crypto_utils import encrypt_secret, decrypt_secret, is_encrypted
+from utils.turnstile_utils import validate_turnstile
 
 # Azure Key Vault Standard SKU limit: 25 KB per secret value.
 # PQC encryption (ML-KEM-768 + AES-256-GCM) adds ~1.46 KB fixed overhead

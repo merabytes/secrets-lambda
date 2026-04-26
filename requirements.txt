@@ -1,3 +1,6 @@
-git+https://github.com/merabytes/acido.git@v0.53.0
+azure-keyvault-secrets>=4.7.0
+azure-identity>=1.16.0
+requests>=2.31.0
 kyber-py>=1.2.0
+pycryptodome>=3.20.0
 cryptography>=41.0.0

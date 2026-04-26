@@ -6,19 +6,13 @@ set -e
 export SECRET_KEY="${SECRET_KEY:-local-test-secret-key-xyz}"
 export CF_SECRET_KEY="${CF_TEST_KEY:-1x0000000000000000000000000000000AA}"
 
-ACIDO_PATH=$(python3.11 -c "import acido, os; print(os.path.dirname(os.path.dirname(acido.__file__)))" 2>/dev/null || echo "")
-if [ -z "$ACIDO_PATH" ]; then
-  echo "❌ acido not found — run: pip3 install -e ~/acido"
-  exit 1
-fi
-
-echo "Running E2E tests (acido from $ACIDO_PATH)..."
-PYTHONPATH="$(pwd):$ACIDO_PATH" python3.11 - << 'PYEOF'
+echo "Running E2E tests..."
+PYTHONPATH="$(pwd)" python3 - << 'PYEOF'
 import sys, os, json
 from unittest.mock import MagicMock, patch
 
 stored = {}
-with patch('acido.azure_utils.VaultManager.VaultManager') as MockVM:
+with patch('utils.vault_manager.VaultManager') as MockVM:
     vm = MagicMock()
     vm.set_secret.side_effect = lambda n,v: stored.__setitem__(n,v)
     vm.get_secret.side_effect = lambda n: stored.get(n)
