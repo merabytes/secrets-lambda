@@ -1,9 +1,6 @@
 name: Deploy Secrets Lambda to AWS (Multi-Region)
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 env:
